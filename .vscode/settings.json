@@ -1,0 +1,8 @@
+{
+    // Tells VS Code that your project depends on the ANTLR runtime jar
+    "java.project.referencedLibraries": [
+      "libs/antlr-4.13.2-complete.jar"
+    ],
+    "liveServer.settings.port": 5503
+  }
+  

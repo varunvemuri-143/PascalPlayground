@@ -1,0 +1,1334 @@
+package main;
+
+import generated.delphiLexer;
+import generated.delphiParser;
+import generated.delphiBaseVisitor;
+
+import org.antlr.v4.runtime.CharStreams;
+import org.antlr.v4.runtime.CharStream;
+import org.antlr.v4.runtime.CommonTokenStream;
+import org.antlr.v4.runtime.tree.ParseTree;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.*;
+
+/**
+ * LLVMGenerator
+ *
+ * Walks the ANTLR-generated parse tree for your Delphi grammar and emits LLVM IR.
+ * Outputs to output/<basename>.ll
+ */
+public class LLVMGenerator extends delphiBaseVisitor<String> {
+
+    // IR sections
+    private final StringBuilder hdr     = new StringBuilder();
+    private final StringBuilder structs = new StringBuilder();
+    private final StringBuilder methods = new StringBuilder();
+    private final StringBuilder main    = new StringBuilder();
+
+    // temp counters
+    private int r = 0, s = 0;
+    private String reg() { return "%r" + (r++); }
+    private String str() { return "@.str." + (s++); }
+
+    // which section we're writing into
+    private enum Area { MAIN, METHOD }
+    private Area area = Area.MAIN;
+    private StringBuilder out() { return area == Area.MAIN ? main : methods; }
+
+    // --- CLASS field tracking ---
+    private final Map<String,Map<String,String>> classFieldTypes  = new LinkedHashMap<>();
+    private final Map<String,List<String>>       classFieldOrder  = new LinkedHashMap<>();
+
+    private final Map<String,ClassInfo> classes  = new LinkedHashMap<>();
+    private final Deque<Map<String,String>> objClass = new ArrayDeque<>();
+    private final List<MethodInfo> classMethods = new ArrayList<>();
+    private final List<MethodInfo> methodsInClasses = new ArrayList<>();
+    private final Deque<String> currentClass = new ArrayDeque<>();  // Stack for tracking current class context
+
+    private void newline() { out().append('\n'); }
+
+    // Add this method after the newline() method
+    private String sizeofStruct(String cls) {
+        String tmp = reg(), size = reg();
+        out().append("  ").append(tmp)
+            .append(" = getelementptr %struct.").append(cls)
+            .append(", %struct.").append(cls).append("* null, i32 1\n");
+        out().append("  ").append(size)
+            .append(" = ptrtoint %struct.").append(cls)
+            .append("* ").append(tmp).append(" to i32\n");
+        return size;
+    }
+
+    // simple type mapping (base types + classes)
+    private static String llTy(String delphi) {
+        switch (delphi.toLowerCase()) {
+            case "integer": case "boolean": return "i32";
+            case "string":  return "i8*";
+            default:
+                // any other identifier → struct pointer
+                return "%struct." + delphi + "*";
+        }
+    }
+
+    // symbol tables
+    private final Deque<Map<String,String>> vSlots = new ArrayDeque<>();  // var → alloca/register
+    private final Deque<Map<String,String>> vTypes = new ArrayDeque<>();  // var → llvm type
+    private final Deque<Set<String>>       regIds = new ArrayDeque<>();   // which ids are registers
+
+    // stacks for break/continue targets
+    private final Deque<String> breakLabels    = new ArrayDeque<>();
+    private final Deque<String> continueLabels = new ArrayDeque<>();
+
+    // resolve a slot (alloca or GEP) for a variable or qualified field
+    private String slotOf(String id) {
+        if (id.contains(".")) {
+            String[] parts = id.split("\\.",2);
+            String obj   = parts[0], field = parts[1];
+            String objSlot     = slotOf(obj);             // pointer to struct
+            String structPtrTy = typeOf(obj);             // "%struct.ClassName*"
+            String structTy    = structPtrTy.replaceFirst("\\*$",""); // "%struct.ClassName"
+
+            // find field index
+            String className = structTy.substring("%struct.".length());
+            List<String> order = classFieldOrder.get(className);
+            if (order == null || !order.contains(field)) {
+                throw new RuntimeException("no such field ‘"+field+"’ on class "+className);
+            }
+            int idx = order.indexOf(field);
+
+            // generate a GEP to &obj.field
+            String gep = reg();
+            out().append("  ").append(gep)
+                 .append(" = getelementptr ").append(structTy).append(", ")
+                 .append(structTy).append("* ").append(objSlot)
+                 .append(", i32 0, i32 ").append(idx).append("\n");
+            return gep;
+        }
+        for (var m : vSlots) if (m.containsKey(id)) return m.get(id);
+        throw new RuntimeException("undeclared variable ‘"+id+"’");
+    }
+
+    // resolve a type for a variable or qualified field
+    private String typeOf(String id) {
+        if (id.contains(".")) {
+            String[] parts = id.split("\\.",2);
+            String obj   = parts[0], field = parts[1];
+            String structPtrTy = typeOf(obj); // "%struct.ClassName*"
+            String className   = structPtrTy
+                                    .replaceFirst("%struct\\.","")
+                                    .replaceFirst("\\*$","");
+            Map<String,String> fields = classFieldTypes.get(className);
+            if (fields == null || !fields.containsKey(field)) {
+                throw new RuntimeException("no type for field ‘"+field+"’ on "+className);
+            }
+            return fields.get(field);
+        }
+        for (var m : vTypes) if (m.containsKey(id)) return m.get(id);
+        throw new RuntimeException("no type for ‘"+id+"’");
+    }
+
+    private boolean isRegister(String id) {
+        for (var s : regIds) if (s.contains(id)) return true;
+        return false;
+    }
+
+    // ctor: initialize headers and root scopes
+    public LLVMGenerator() {
+        hdr.append(
+              "; LLVM IR generated by LLVMGenerator\n"
+            + "target datalayout = \"e-m:e-p:32:32:i64:64-n32:64-S128\"\n"
+            + "target triple   = \"wasm32-unknown-unknown\"\n\n"
+            + "declare i8*  @malloc(i32)\n"
+            + "declare void @printInt(i32)\n"
+            + "declare void @printString(i8*)\n"
+            + "declare i32  @readInt()\n\n"
+        );
+        // Initialize the scopes
+        vSlots.push(new HashMap<>());
+        vTypes.push(new HashMap<>());
+        regIds.push(new HashSet<>());
+        objClass.push(new HashMap<>());
+    }
+
+    /** Entry: assemble full IR */
+    public String compile(ParseTree tree) {
+        visit(tree);
+        emitStructs();
+        emitMethods();
+        return hdr + "\n" + structs + "\n" + methods + "\n" + main;
+    }
+
+    // Added missing method
+    private void emitStructs() {
+        // No-op, structs are already appended in visitClassDeclaration
+    }
+
+    //——————————— Class / Struct Support ———————————
+    @Override
+    public String visitClassDeclaration(delphiParser.ClassDeclarationContext ctx) {
+        String cls = ctx.IDENTIFIER().getText();
+        currentClass.push(cls);
+        classes.put(cls, new ClassInfo(cls));
+        Map<String,String> ftypes = new LinkedHashMap<>();
+        List<String> order = new ArrayList<>();
+        classFieldTypes.put(cls,ftypes);
+        classFieldOrder.put(cls,order);
+        
+        // Track private fields for encapsulation
+        Set<String> privateFields = new HashSet<>();
+        String currentVisibility = "public"; // Default visibility
+
+        /* pass 1 – fields and methods with visibility */
+        for(var vs:ctx.classBody().visibilitySection()){
+            // Set current visibility section
+            if (vs.PUBLIC() != null) {
+                currentVisibility = "public";
+            } else if (vs.PRIVATE() != null) {
+                currentVisibility = "private";
+            } else if (vs.PROTECTED() != null) {
+                currentVisibility = "protected";
+            }
+            
+            for(var mem:vs.classMember()){
+                if(mem.varDeclaration()!=null){
+                    var vd = mem.varDeclaration();
+                    String llvmTy = llTy(vd.type_().getText()).replaceFirst("\\*$","");
+                    for(var id:vd.identifierList().IDENTIFIER()){
+                        String fieldName = id.getText();
+                        order.add(fieldName);
+                        ftypes.put(fieldName, llvmTy);
+                        
+                        // Track private fields
+                        if ("private".equals(currentVisibility)) {
+                            privateFields.add(fieldName);
+                        }
+                    }
+                }
+                
+                // Check for constructor and method declarations
+                if (mem.constructorDeclaration() != null) {
+                    var ctor = mem.constructorDeclaration();
+                    // Register constructor
+                    String constructorName = "Init";
+                    if (ctor.IDENTIFIER() != null) {
+                        constructorName = ctor.IDENTIFIER().getText();
+                    }
+                    
+                    // Create a dummy procedure declaration for the constructor
+                    MethodInfo methodInfo = new MethodInfo(cls, constructorName, null);
+                    ClassInfo classInfo = classes.get(cls);
+                    classInfo.methods.put(constructorName, methodInfo);
+                }
+                
+                // Handle destructors
+                if (mem.destructorDeclaration() != null) {
+                    var dtor = mem.destructorDeclaration();
+                    // Register destructor
+                    String destructorName = "Destroy";
+                    if (dtor.IDENTIFIER() != null) {
+                        destructorName = dtor.IDENTIFIER().getText();
+                    }
+                    
+                    // Create a dummy procedure declaration for the destructor
+                    MethodInfo methodInfo = new MethodInfo(cls, destructorName, null);
+                    ClassInfo classInfo = classes.get(cls);
+                    classInfo.methods.put(destructorName, methodInfo);
+                }
+            }
+        }
+        
+        // Store private fields in class info
+        ClassInfo info = classes.get(cls);
+        info.privateFields.addAll(privateFields);
+
+        /* emit struct */
+        StringBuilder sb=new StringBuilder();
+        sb.append("%struct.").append(cls).append(" = type { ");
+        for(int i=0;i<order.size();i++){
+            if(i>0) sb.append(", ");
+            sb.append(ftypes.get(order.get(i)));
+        }
+        sb.append(" }\n");
+        structs.append(sb);
+
+        /* visit children so procedureDeclaration visitor will fire */
+        visitChildren(ctx);
+
+        currentClass.pop();
+        return null;
+    }
+    
+    // Add this method to check if a field is private
+    private boolean isPrivateField(String className, String fieldName) {
+        ClassInfo info = classes.get(className);
+        return info != null && info.privateFields.contains(fieldName);
+    }
+
+    // Override variableReference to handle field access correctly
+    @Override 
+    public String visitVariableReference(delphiParser.VariableReferenceContext ctx) {
+        if (ctx.IDENTIFIER().size() > 1) {
+            // This is an object field access: obj.field
+            String objName = ctx.IDENTIFIER(0).getText();
+            String fieldName = ctx.IDENTIFIER(1).getText();
+            
+            // Check if we're not in a method and trying to access a private field
+            if (!currentClass.isEmpty()) {
+                String className = objClass.peek().get(objName);
+                if (className != null && isPrivateField(className, fieldName)) {
+                    // Allow access only if we're inside a method of the same class
+                    if (!currentClass.peek().equals(className)) {
+                        throw new RuntimeException("Cannot access private field '" + fieldName + "' of class '" + className + "'");
+                    }
+                }
+            }
+            
+            // Generate access code (done in slotOf)
+            String id = ctx.getText();
+            if (isRegister(id)) return slotOf(id);
+            String slot = slotOf(id), ty = typeOf(id), tmp = reg();
+            out().append("  ").append(tmp)
+                 .append(" = load ").append(ty)
+                 .append(", ").append(ty).append("* ").append(slot).append("\n");
+            return tmp;
+        }
+        return null; // Handle normal variable references in visitPrimaryExpr
+    }
+
+    //——————————— Program / main ———————————
+    private boolean mainStarted = false;
+
+    @Override
+    public String visitProgram(delphiParser.ProgramContext ctx) {
+        // 1) emit any global declarations (classes, globals, etc.)
+        visit(ctx.block().declarations());
+    
+        // 2) start the LLVM main function
+        main.append("define i32 @main() {\n");
+        main.append("entry:\n");
+        mainStarted = true;
+    
+        // 3) emit the body of the program (compound statement)
+        visit(ctx.block().compoundStatement());
+    
+        // 4) return 0 from main
+        main.append("  ret i32 0\n");
+        main.append("}\n");
+    
+        return null;
+    }
+
+    //——————————— Variables ———————————
+    @Override
+    public String visitVarDeclaration(delphiParser.VarDeclarationContext ctx) {
+        String ty = llTy(ctx.type_().getText());
+        for (var id : ctx.identifierList().IDENTIFIER()) {
+            String name = id.getText();
+            if (!mainStarted) {
+                // global
+                String gv = "@g_" + name;
+                // if it's any pointer type (endsWith "*") use null, otherwise use 0
+                String init = ty.endsWith("*") ? " null" : " 0";
+                hdr.append(gv)
+                   .append(" = global ")
+                   .append(ty)
+                   .append(init)
+                   .append("\n");
+                vSlots.peek().put(name, gv);
+                vTypes.peek().put(name, ty);
+            } else {
+                // local
+                String slot = reg();
+                out().append("  ").append(slot)
+                     .append(" = alloca ").append(ty).append("\n");
+                vSlots.peek().put(name, slot);
+                vTypes.peek().put(name, ty);
+            }
+        }
+        return null;
+    }
+
+    //——————————— Assignment ———————————
+    @Override
+    public String visitAssignmentStatement(delphiParser.AssignmentStatementContext ctx) {
+        String lhs = ctx.variableReference().getText();
+        String rhsExpr = ctx.expression().getText();
+        
+        // Special case for ClassName()
+        if (rhsExpr.endsWith("()")) {
+            String className = rhsExpr.substring(0, rhsExpr.length() - 2);
+            if (classes.containsKey(className)) {
+                // Generate malloc and constructor call
+                String size = sizeofStruct(className);
+                String mallocResult = reg();
+                out().append("  ").append(mallocResult)
+                    .append(" = call i8* @malloc(i32 ").append(size).append(")\n");
+                    
+                String bitcast = reg();
+                out().append("  ").append(bitcast)
+                    .append(" = bitcast i8* ").append(mallocResult)
+                    .append(" to %struct.").append(className).append("*\n");
+                    
+                // Store the result in the lhs
+                String slot = slotOf(lhs);
+                out().append("  store %struct.").append(className).append("* ")
+                    .append(bitcast).append(", %struct.").append(className).append("** ")
+                    .append(slot).append("\n");
+                    
+                // Track the object class
+                objClass.peek().put(lhs, className);
+                
+                return null;
+            }
+        }
+        
+        // Handle normal assignment
+        String rhsReg = visit(ctx.expression());
+        String ty = typeOf(lhs);
+        String slot = slotOf(lhs);
+        
+        // Ensure proper typing for struct pointers
+        if (ty.contains("struct") && !ty.contains("*")) {
+            ty = ty + "*"; // Ensure pointer type for struct
+        }
+        
+        // Handle class constructor and instance assignments
+        if (ctx.expression().getText().contains(".Create")) {
+            // This is likely a call to a constructor
+            // Extract class name from the expression
+            String expr = ctx.expression().getText();
+            String className = expr.substring(0, expr.indexOf("."));
+            
+            // Generate malloc and constructor call
+            String size = sizeofStruct(className);
+            String mallocResult = reg();
+            out().append("  ").append(mallocResult)
+                .append(" = call i8* @malloc(i32 ").append(size).append(")\n");
+                
+            String bitcast = reg();
+            out().append("  ").append(bitcast)
+                .append(" = bitcast i8* ").append(mallocResult)
+                .append(" to %struct.").append(className).append("*\n");
+                
+                // Call constructor
+                out().append("  call void @").append(className).append("_Init")
+                    .append("(%struct.").append(className).append("* ").append(bitcast).append(")\n");
+                
+                // Store the result in the lhs
+                out().append("  store %struct.").append(className).append("* ")
+                    .append(bitcast).append(", %struct.").append(className).append("** ")
+                    .append(slot).append("\n");
+                
+                // Store class mapping
+                objClass.peek().put(lhs, className);
+                
+                return null;
+            }
+        }
+        
+        // Regular assignment
+        out().append("  store ").append(ty).append(" ")
+             .append(rhsReg).append(", ").append(ty)
+             .append("* ").append(slot).append("\n");
+        
+        // Track object-class mapping for class instance assignments
+        // This might be a constructor result or another object
+        if (objClass.peek().containsKey(rhsReg)) {
+            // Propagate class mapping from source to destination
+            objClass.peek().put(lhs, objClass.peek().get(rhsReg));
+        } else if (ty.startsWith("%struct.") && ty.endsWith("*")) {
+            // Direct struct type assignment (e.g., from a ClassName.Create() call)
+            String className = ty.substring("%struct.".length(), ty.length() - 1);
+            objClass.peek().put(lhs, className);
+        }
+        
+        return null;
+    }
+
+    //────────────────── Proc / Func / Print ──────────────────
+    @Override
+    public String visitProcFuncCallStatement(delphiParser.ProcFuncCallStatementContext ctx) {
+        String name = ctx.IDENTIFIER().getText();
+    
+        // 1) Handle class instantiation with just ClassName()
+        if (classes.containsKey(name) && ctx.argumentList() == null) {
+            // This is a class constructor
+            String className = name;
+            
+            // Generate malloc and constructor call
+            String size = sizeofStruct(className);
+            String mallocResult = reg();
+            out().append("  ").append(mallocResult)
+                .append(" = call i8* @malloc(i32 ").append(size).append(")\n");
+                
+            String bitcast = reg();
+            out().append("  ").append(bitcast)
+                .append(" = bitcast i8* ").append(mallocResult)
+                .append(" to %struct.").append(className).append("*\n");
+                
+            // Store the object pointer in fh
+            out().append("  store %struct.").append(className).append("* ")
+                .append(bitcast).append(", %struct.").append(className).append("** @g_")
+                .append(name.toLowerCase()).append("\n");
+                
+            return null;
+        }
+    
+        // 2) readInt(): discard return value
+        if (name.equals("readInt")) {
+            out().append("  call i32 @readInt()\n");
+            return null;
+        }
+    
+        // 3) built-in printing (printInt, printString) and aliases (write, writeln)
+        if (name.equals("printInt") ||
+            name.equals("printString") ||
+            name.equals("write") ||
+            name.equals("writeln")) {
+            // for each argument, choose the correct printer based on its LLVM type
+            if (ctx.argumentList() != null) {
+                for (var e : ctx.argumentList().expression()) {
+                    String v  = visit(e);
+                    String t  = inferType(e);                          // "i8*" or "i32"
+                    String fn = t.equals("i8*") ? "printString"        // strings → printString
+                                                : "printInt";          // ints    → printInt
+                    out().append("  call void @")
+                         .append(fn)
+                         .append("(").append(t).append(" ").append(v).append(")\n");
+                }
+            }
+            return null;
+        }
+    
+        // 4) fallback to user-defined procedures/functions
+        return super.visitProcFuncCallStatement(ctx);
+    }
+    
+
+
+    //——————————— Expressions ———————————
+    @Override public String visitPrimaryExpr(delphiParser.PrimaryExprContext ctx) {
+        if (ctx.INT_LITERAL()!=null) {
+            String r0 = reg();
+            out().append("  ").append(r0)
+                 .append(" = add i32 0, ").append(ctx.INT_LITERAL().getText()).append("\n");
+            return r0;
+        }
+        if (ctx.STRING_LITERAL()!=null) {
+            String txt = ctx.STRING_LITERAL().getText();
+            txt = txt.substring(1, txt.length()-1);
+            String lbl = str(), ptr = reg();
+            hdr.append(lbl)
+               .append(" = private unnamed_addr constant [")
+               .append(txt.length()+1).append(" x i8] c\"")
+               .append(txt.replace("\\","\\\\").replace("\"","\\\""))
+               .append("\\00\", align 1\n");
+            out().append("  ").append(ptr)
+               .append(" = bitcast [").append(txt.length()+1)
+               .append(" x i8]* ").append(lbl)
+               .append(" to i8*\n");
+            return ptr;
+        }
+        if (ctx.TRUE()!=null || ctx.FALSE()!=null) {
+            String lit = ctx.TRUE()!=null ? "1" : "0";
+            String r0  = reg();
+            out().append("  ").append(r0)
+                 .append(" = add i32 0, ").append(lit).append("\n");
+            return r0;
+        }
+        if (ctx.variableReference()!=null) {
+            String id = ctx.variableReference().getText();
+            if (isRegister(id)) return slotOf(id);
+            String slot = slotOf(id), ty = typeOf(id), tmp = reg();
+            out().append("  ").append(tmp)
+               .append(" = load ").append(ty)
+               .append(", ").append(ty).append("* ").append(slot).append("\n");
+            return tmp;
+        }
+        if (ctx.LPAREN()!=null) {
+            return visit(ctx.expression());
+        }
+        return null;
+    }
+
+    @Override public String visitAdditiveExpr(delphiParser.AdditiveExprContext ctx) {
+        List<delphiParser.MultiplicativeExprContext> parts = ctx.multiplicativeExpr();
+        String res = visit(parts.get(0));
+        for (int i=1;i<parts.size();i++) {
+            String rhs = visit(parts.get(i));
+            String op  = ctx.getChild(2*i-1).getText().equals("+")?"add":"sub";
+            String tmp = reg();
+            out().append("  ").append(tmp)
+                 .append(" = ").append(op).append(" i32 ")
+                 .append(res).append(", ").append(rhs).append("\n");
+            res = tmp;
+        }
+        return res;
+    }
+
+    @Override public String visitMultiplicativeExpr(delphiParser.MultiplicativeExprContext ctx) {
+        List<delphiParser.UnaryExprContext> parts = ctx.unaryExpr();
+        String res = visit(parts.get(0));
+        for (int i=1;i<parts.size();i++) {
+            String rhs = visit(parts.get(i));
+            String tok = ctx.getChild(2*i-1).getText();
+            String op  = tok.equals("*")?"mul":"sdiv";
+            String tmp = reg();
+            out().append("  ").append(tmp)
+                 .append(" = ").append(op).append(" i32 ")
+                 .append(res).append(", ").append(rhs).append("\n");
+            res = tmp;
+        }
+        return res;
+    }
+
+    @Override public String visitRelationalExpr(delphiParser.RelationalExprContext ctx) {
+        List<delphiParser.AdditiveExprContext> parts = ctx.additiveExpr();
+        String res = visit(parts.get(0));
+        if (parts.size()>1) {
+            String rhs = visit(parts.get(1));
+            String op  = ctx.getChild(1).getText();
+            String cmp;
+            switch(op) {
+                case "=" : cmp="eq";  break;
+                case "<>": cmp="ne";  break;
+                case "<":  cmp="slt"; break;
+                case "<=": cmp="sle"; break;
+                case ">":  cmp="sgt"; break;
+                default:   cmp="sge"; break;
+            }
+            String t1 = reg();
+            out().append("  ").append(t1)
+                 .append(" = icmp ").append(cmp)
+                 .append(" i32 ").append(res).append(", ").append(rhs).append("\n");
+            String t2 = reg();
+            out().append("  ").append(t2)
+                 .append(" = zext i1 ").append(t1).append(" to i32\n");
+            res = t2;
+        }
+        return res;
+    }
+
+    //——————————— Control-Flow ———————————
+    @Override
+    public String visitIfStatement(delphiParser.IfStatementContext ctx) {
+        String condVal  = visit(ctx.expression());
+        String condBool = reg();
+        out().append("  ").append(condBool)
+             .append(" = icmp ne i32 ").append(condVal).append(", 0\n");
+        String thenLbl = "then"  + (s++);
+        String elseLbl = ctx.ELSE()!=null ? "else" + (s++) : null;
+        String endLbl  = "endif" + (s++);
+        if (elseLbl != null) {
+            out().append("  br i1 ").append(condBool)
+                 .append(", label %").append(thenLbl)
+                 .append(", label %").append(elseLbl).append("\n\n");
+        } else {
+            out().append("  br i1 ").append(condBool)
+                 .append(", label %").append(thenLbl)
+                 .append(", label %").append(endLbl).append("\n\n");
+        }
+        out().append(thenLbl).append(":\n");
+        visit(ctx.statement(0));
+        out().append("  br label %").append(endLbl).append("\n\n");
+        if (elseLbl != null) {
+            out().append(elseLbl).append(":\n");
+            visit(ctx.statement(1));
+            out().append("  br label %").append(endLbl).append("\n\n");
+        }
+        out().append(endLbl).append(":\n");
+        return null;
+    }
+
+    @Override
+    public String visitWhileStatement(delphiParser.WhileStatementContext ctx) {
+        String condLbl = "whilecond" + (s++);
+        String bodyLbl = "whilebody" + (s++);
+        String endLbl  = "whileend"  + (s++);
+        out().append("  br label %").append(condLbl).append("\n\n");
+        out().append(condLbl).append(":\n");
+        String condVal  = visit(ctx.expression());
+        String condBool = reg();
+        out().append("  ").append(condBool)
+             .append(" = icmp ne i32 ").append(condVal).append(", 0\n");
+        out().append("  br i1 ").append(condBool)
+             .append(", label %").append(bodyLbl)
+             .append(", label %").append(endLbl).append("\n\n");
+        out().append(bodyLbl).append(":\n");
+        breakLabels.push(endLbl);
+        continueLabels.push(condLbl);
+        visit(ctx.statement());
+        out().append("  br label %").append(condLbl).append("\n\n");
+        breakLabels.pop();
+        continueLabels.pop();
+        out().append(endLbl).append(":\n");
+        return null;
+    }
+
+    @Override
+    public String visitForStatement(delphiParser.ForStatementContext ctx) {
+
+        String varName = ctx.IDENTIFIER().getText();
+        String slot    = slotOf(varName);
+        String ty      = typeOf(varName);
+
+        // initialise i := <low>
+        String low = visit(ctx.expression(0));
+        out().append("  store ").append(ty).append(' ').append(low)
+             .append(", ").append(ty).append("* ").append(slot).append('\n');
+
+        // labels
+        String condLbl = "forcond" + (s++);
+        String bodyLbl = "forbody" + (s++);
+        String incLbl  = "forinc"  + (s++);
+        String endLbl  = "forend"  + (s++);
+
+        // jump to condition
+        out().append("  br label %").append(condLbl).append('\n').append('\n');
+
+        /* ---------- condition block ---------- */
+        out().append(condLbl).append(":\n");
+        String cur  = reg();
+        out().append("  ").append(cur)
+             .append(" = load ").append(ty).append(", ").append(ty)
+             .append("* ").append(slot).append('\n');
+        String high = visit(ctx.expression(1));
+        String cmp  = reg();
+        if (ctx.TO() != null) {
+            out().append("  ").append(cmp)
+                 .append(" = icmp sle ").append(ty).append(' ')
+                 .append(cur).append(", ").append(high).append('\n');
+        } else {
+            out().append("  ").append(cmp)
+                 .append(" = icmp sge ").append(ty).append(' ')
+                 .append(cur).append(", ").append(high).append('\n');
+        }
+        out().append("  br i1 ").append(cmp)
+             .append(", label %").append(bodyLbl)
+             .append(", label %").append(endLbl).append('\n').append('\n');
+
+        /* ---------- body block ---------- */
+        out().append(bodyLbl).append(":\n");
+        breakLabels.push(endLbl);
+        continueLabels.push(incLbl);           // continue → increment
+        visit(ctx.statement());
+        breakLabels.pop();
+        continueLabels.pop();
+
+        //  **NEW** – end body with an explicit jump to the increment block
+        out().append("  br label %").append(incLbl).append('\n');
+
+        /* ---------- increment block ---------- */
+        newline();                             // just a blank line
+        out().append(incLbl).append(":\n");
+        String next = reg();
+        if (ctx.TO() != null) {
+            out().append("  ").append(next)
+                 .append(" = add ").append(ty).append(' ')
+                 .append(cur).append(", 1\n");
+        } else {
+            out().append("  ").append(next)
+                 .append(" = sub ").append(ty).append(' ')
+                 .append(cur).append(", 1\n");
+        }
+        out().append("  store ").append(ty).append(' ').append(next)
+             .append(", ").append(ty).append("* ").append(slot).append('\n');
+        out().append("  br label %").append(condLbl).append('\n').append('\n');
+
+        /* ---------- end block ---------- */
+        out().append(endLbl).append(":\n");
+        return null;
+    }
+    
+
+
+    @Override
+    public String visitBreakStatement(delphiParser.BreakStatementContext ctx) {
+        if (breakLabels.isEmpty()) throw new RuntimeException("'break' outside of loop");
+        out().append("  br label %").append(breakLabels.peek()).append("\n");
+        return null;
+    }
+
+    @Override
+    public String visitContinueStatement(delphiParser.ContinueStatementContext ctx) {
+        if (continueLabels.isEmpty()) throw new RuntimeException("'continue' outside of loop");
+        out().append("  br label %").append(continueLabels.peek()).append("\n");
+        return null;
+    }
+
+    //——————————— Procedures & Functions ———————————
+    private final Map<String,ProcInfo> procs = new LinkedHashMap<>();
+    private final Map<String,FuncInfo> funcs = new LinkedHashMap<>();
+
+    @Override
+    public String visitProcedureDeclaration(delphiParser.ProcedureDeclarationContext ctx) {
+        if (!mainStarted) {
+            ProcInfo p = new ProcInfo(ctx.IDENTIFIER().getText());
+            if (ctx.formalParameters()!=null) {
+                for (var par : ctx.formalParameters().formalParameter()) {
+                    p.pNames.addAll(
+                      par.identifierList().IDENTIFIER().stream().map(t->t.getText()).toList()
+                    );
+                    p.pTypes.add(par.type_().getText());
+                }
+            }
+            p.body = ctx.compoundStatement();
+            procs.put(p.name,p);
+            
+            // Check if it's a class method
+            if (!currentClass.isEmpty()) {
+                String className = currentClass.peek();
+                ClassInfo info = classes.get(className);
+                if (info != null) {
+                    MethodInfo method = new MethodInfo(className, p.name, ctx);
+                    info.methods.put(p.name, method);
+                    methodsInClasses.add(method);
+                }
+            }
+        }
+        return null;
+    }
+
+    @Override
+    public String visitFunctionDeclaration(delphiParser.FunctionDeclarationContext ctx) {
+        if (!mainStarted) {
+            FuncInfo f = new FuncInfo(ctx.IDENTIFIER().getText());
+            f.retType = ctx.type_().getText();
+            if (ctx.formalParameters()!=null) {
+                for (var par : ctx.formalParameters().formalParameter()) {
+                    f.pNames.addAll(
+                      par.identifierList().IDENTIFIER().stream().map(t->t.getText()).toList()
+                    );
+                    f.pTypes.add(par.type_().getText());
+                }
+            }
+            f.body = ctx.compoundStatement();
+            funcs.put(f.name,f);
+        }
+        return null;
+    }
+
+    //——————————— Compound / scope ———————————
+    @Override
+    public String visitCompoundStatement(delphiParser.CompoundStatementContext ctx) {
+        // Create new scopes for variables, registers, and object mappings
+        vSlots.push(new HashMap<>(vSlots.peek()));
+        vTypes.push(new HashMap<>(vTypes.peek()));
+        regIds.push(new HashSet<>());
+        
+        // Create a new objClass scope - use empty Map if stack is empty
+        Map<String,String> currentObjClass = objClass.isEmpty() ? 
+                                             new HashMap<>() : 
+                                             new HashMap<>(objClass.peek());
+        objClass.push(currentObjClass);
+        
+        // Process all statements in the compound block
+        for (var st : ctx.statementList().statement()) {
+            visit(st);
+        }
+        
+        // Pop all the scopes
+        regIds.pop();
+        vTypes.pop();
+        vSlots.pop();
+        objClass.pop();
+        
+        return null;
+    }
+
+    //——————————— Emit methods ———————————
+    private void emitMethods() {
+        // Maintain a set of methods already emitted to avoid duplicates
+        Set<String> emittedMethods = new HashSet<>();
+        
+        // Emit regular procedures
+        for (var p : procs.values()) {
+            // Skip class methods which are handled separately
+            if (classMethods.stream().anyMatch(m -> m.name.equals(p.name))) {
+                continue;
+            }
+            
+            // Avoid emitting standalone versions of class methods
+            boolean isClassMethod = false;
+            for (var classInfo : classes.values()) {
+                if (classInfo.methods.containsKey(p.name)) {
+                    isClassMethod = true;
+                    break;
+                }
+            }
+            if (isClassMethod) {
+                continue;
+            }
+            
+            methods.append("define void @").append(p.name).append("(");
+            for (int i = 0; i < p.pNames.size(); i++) {
+                if (i>0) methods.append(", ");
+                methods.append(llTy(p.pTypes.get(i))).append(" %").append(p.pNames.get(i));
+            }
+            methods.append(") {\nentry:\n");
+            
+            // Set up for body emission
+            Area prevArea = area;
+            area = Area.METHOD;
+            
+            // Push new scope for parameters
+            vSlots.push(new HashMap<>());
+            vTypes.push(new HashMap<>());
+            regIds.push(new HashSet<>());
+            objClass.push(new HashMap<>());
+            
+            // Allocate parameters on stack and store
+            for (int i = 0; i < p.pNames.size(); i++) {
+                String paramName = p.pNames.get(i);
+                String paramType = llTy(p.pTypes.get(i));
+                String slot = reg();
+                
+                methods.append("  ").append(slot)
+                       .append(" = alloca ").append(paramType).append("\n");
+                methods.append("  store ").append(paramType).append(" %")
+                       .append(paramName).append(", ").append(paramType)
+                       .append("* ").append(slot).append("\n");
+                
+                vSlots.peek().put(paramName, slot);
+                vTypes.peek().put(paramName, paramType);
+            }
+            
+            // Now emit the body
+            if (p.body != null) {
+                visit(p.body);
+            }
+            
+            // Pop scope
+            vSlots.pop();
+            vTypes.pop();
+            regIds.pop();
+            objClass.pop();
+            
+            // Return to previous area
+            area = prevArea;
+            
+            methods.append("  ret void\n}\n\n");
+        }
+        
+        // Emit class methods
+        for (var classInfo : classes.values()) {
+            String className = classInfo.name;
+            
+            // Generate constructors (Init methods) once
+            String initMethodName = className + "_Init";
+            if (!emittedMethods.contains(initMethodName)) {
+                emittedMethods.add(initMethodName);
+                
+                methods.append("define void @").append(initMethodName)
+                       .append("(%struct.").append(className).append("* %this) {\n")
+                       .append("entry:\n");
+                
+                // Initialize all fields to zero/null
+                Map<String, String> fields = classFieldTypes.get(className);
+                List<String> order = classFieldOrder.get(className);
+                
+                if (fields != null && order != null) {
+                    for (int i = 0; i < order.size(); i++) {
+                        String field = order.get(i);
+                        String fieldType = fields.get(field);
+                        
+                        // Generate GEP to access the field
+                        String gep = "%" + field + ".ptr";
+                        methods.append("  ").append(gep)
+                               .append(" = getelementptr %struct.").append(className)
+                               .append(", %struct.").append(className).append("* %this")
+                               .append(", i32 0, i32 ").append(i).append("\n");
+                        
+                        // Initialize field based on type
+                        String initValue;
+                        if (fieldType.endsWith("*")) {
+                            initValue = "null";
+                        } else {
+                            initValue = "0";
+                        }
+                        
+                        methods.append("  store ").append(fieldType).append(" ")
+                               .append(initValue).append(", ").append(fieldType)
+                               .append("* ").append(gep).append("\n");
+                    }
+                }
+                
+                methods.append("  ret void\n}\n\n");
+            }
+            
+            // Add a destructor if needed
+            String destroyMethodName = className + "_Destroy";
+            if (!emittedMethods.contains(destroyMethodName) && classInfo.methods.containsKey("Destroy")) {
+                emittedMethods.add(destroyMethodName);
+                
+                methods.append("define void @").append(destroyMethodName)
+                       .append("(%struct.").append(className).append("* %this) {\n")
+                       .append("entry:\n");
+                
+                // In a real implementation, we'd clean up resources here
+                // For now, just a placeholder destructor
+                
+                methods.append("  ret void\n}\n\n");
+            }
+            
+            // Generate other class methods
+            for (var methodEntry : classInfo.methods.entrySet()) {
+                MethodInfo methodInfo = methodEntry.getValue();
+                // Skip constructors and destructors as they were handled above
+                if (methodInfo.name.equals("Init") || methodInfo.name.equals("Create") || 
+                    methodInfo.name.equals("Destroy")) {
+                    continue;
+                }
+                
+                String methodName = className + "_" + methodInfo.name;
+                if (emittedMethods.contains(methodName)) {
+                    continue;
+                }
+                emittedMethods.add(methodName);
+                
+                methods.append("define void @").append(methodName)
+                       .append("(%struct.").append(className).append("* %this");
+                
+                // Add parameters if any
+                if (methodInfo.body != null && methodInfo.body.formalParameters() != null) {
+                    var params = methodInfo.body.formalParameters().formalParameter();
+                    int paramCount = 0;
+                    
+                    for (var param : params) {
+                        String paramType = llTy(param.type_().getText());
+                        for (var id : param.identifierList().IDENTIFIER()) {
+                            methods.append(", ").append(paramType)
+                                   .append(" %p").append(paramCount++);
+                        }
+                    }
+                }
+                
+                methods.append(") {\nentry:\n");
+                
+                // Set up for method body emission
+                Area prevArea = area;
+                area = Area.METHOD;
+                
+                // Push scopes for method context
+                vSlots.push(new HashMap<>());
+                vTypes.push(new HashMap<>());
+                regIds.push(new HashSet<>());
+                objClass.push(new HashMap<>());
+                
+                // Add the current class to the scope for access control
+                currentClass.push(className);
+                
+                // Add 'this' pointer to scope
+                vSlots.peek().put("this", "%this");
+                vTypes.peek().put("this", "%struct." + className + "*");
+                objClass.peek().put("this", className);
+                
+                // Process parameters if any
+                if (methodInfo.body != null && methodInfo.body.formalParameters() != null) {
+                    var params = methodInfo.body.formalParameters().formalParameter();
+                    int paramCount = 0;
+                    
+                    for (var param : params) {
+                        String paramType = llTy(param.type_().getText());
+                        for (var id : param.identifierList().IDENTIFIER()) {
+                            String paramName = id.getText();
+                            String paramSlot = reg();
+                            
+                            methods.append("  ").append(paramSlot)
+                                   .append(" = alloca ").append(paramType).append("\n");
+                            methods.append("  store ").append(paramType)
+                                   .append(" %p").append(paramCount)
+                                   .append(", ").append(paramType)
+                                   .append("* ").append(paramSlot).append("\n");
+                            
+                            vSlots.peek().put(paramName, paramSlot);
+                            vTypes.peek().put(paramName, paramType);
+                            paramCount++;
+                        }
+                    }
+                }
+                
+                // Add access to class fields in the method scope
+                Map<String, String> fields = classFieldTypes.get(className);
+                List<String> order = classFieldOrder.get(className);
+                
+                if (fields != null && order != null) {
+                    for (int i = 0; i < order.size(); i++) {
+                        String field = order.get(i);
+                        String fieldType = fields.get(field);
+                        
+                        // Create a GEP for this field for direct access in methods
+                        String gep = reg();
+                        methods.append("  ").append(gep)
+                               .append(" = getelementptr %struct.").append(className)
+                               .append(", %struct.").append(className).append("* %this")
+                               .append(", i32 0, i32 ").append(i).append("\n");
+                        
+                        // Add field to scope for direct access in method body
+                        vSlots.peek().put(field, gep);
+                        vTypes.peek().put(field, fieldType);
+                    }
+                }
+                
+                // Emit method body
+                if (methodInfo.body != null && methodInfo.body.compoundStatement() != null) {
+                    visit(methodInfo.body.compoundStatement());
+                }
+                
+                // Pop scopes
+                currentClass.pop();
+                vSlots.pop();
+                vTypes.pop();
+                regIds.pop();
+                objClass.pop();
+                
+                // Return to previous area
+                area = prevArea;
+                
+                methods.append("  ret void\n}\n\n");
+            }
+        }
+        
+        // Emit regular functions
+        for (var f : funcs.values()) {
+            methods.append("define ").append(llTy(f.retType))
+                   .append(" @").append(f.name).append("(");
+            for (int i = 0; i < f.pNames.size(); i++) {
+                if (i>0) methods.append(", ");
+                methods.append(llTy(f.pTypes.get(i))).append(" %").append(f.pNames.get(i));
+            }
+            methods.append(") {\nentry:\n  ret ")
+                   .append(llTy(f.retType)).append(" 0\n}\n\n");
+        }
+    }
+
+    private static String inferType(org.antlr.v4.runtime.tree.ParseTree e) {
+        String t = e.getText();
+        // treat both "..." and '...' as strings
+        if ((t.startsWith("\"") && t.endsWith("\"")) ||
+            (t.startsWith("'") && t.endsWith("'"))) {
+            return "i8*";
+        }
+        return "i32";
+    }
+    
+
+    private static final class ProcInfo {
+        String name;
+        List<String> pNames = new ArrayList<>();
+        List<String> pTypes = new ArrayList<>();
+        delphiParser.CompoundStatementContext body;
+        ProcInfo(String n){ name = n; }
+    }
+    private static final class FuncInfo {
+        String name, retType;
+        List<String> pNames = new ArrayList<>();
+        List<String> pTypes = new ArrayList<>();
+        delphiParser.CompoundStatementContext body;
+        FuncInfo(String n){ name = n; }
+    }
+
+    // Add ClassInfo to track private fields
+    private static final class ClassInfo {
+        final String name;
+        final Map<String,MethodInfo> methods = new LinkedHashMap<>();
+        final Set<String> privateFields = new HashSet<>();
+        ClassInfo(String n){ name = n; }
+    }
+
+    private static final class MethodInfo {
+        final String ownerClass;             // e.g. "AlphaWidget"
+        final String name;                   // e.g. "Activate"
+        final List<String> pTypes = new ArrayList<>();   // parameter LLVM types
+        final delphiParser.ProcedureDeclarationContext body;
+
+        MethodInfo(String ownerClass,
+                   String name,
+                   delphiParser.ProcedureDeclarationContext body)
+        {
+            this.ownerClass = ownerClass;
+            this.name       = name;
+            this.body       = body;
+        }
+    }
+
+    // Add the visitMethodCall implementation
+    @Override
+    public String visitMethodCall(delphiParser.MethodCallContext ctx) {
+        String objName = ctx.IDENTIFIER(0).getText();
+        String methodName = ctx.IDENTIFIER(1).getText();
+        
+        // Check if this is a class constructor (ClassName.Create)
+        if (classes.containsKey(objName) && methodName.equals("Create")) {
+            // This is a constructor call (ClassName.Create())
+            String className = objName;
+            
+            // 1. Malloc space for the class
+            String size = sizeofStruct(className);
+            String mallocResult = reg();
+            out().append("  ").append(mallocResult)
+                .append(" = call i8* @malloc(i32 ").append(size).append(")\n");
+            
+            // 2. Bitcast to the struct pointer type
+            String bitcast = reg();
+            out().append("  ").append(bitcast)
+                .append(" = bitcast i8* ").append(mallocResult)
+                .append(" to %struct.").append(className).append("*\n");
+            
+            // 3. Call the init method
+            String constructorName = className + "_Init";
+            out().append("  call void @").append(constructorName)
+                .append("(%struct.").append(className).append("* ").append(bitcast);
+            
+            // Handle constructor arguments if any
+            if (ctx.argumentList() != null) {
+                for (int i = 0; i < ctx.argumentList().expression().size(); i++) {
+                    String arg = visit(ctx.argumentList().expression(i));
+                    out().append(", i32 ").append(arg);
+                }
+            }
+            
+            out().append(")\n");
+            
+            // Register this temporary so we know its class
+            regIds.peek().add(bitcast);
+            vSlots.peek().put(bitcast, bitcast);
+            vTypes.peek().put(bitcast, "%struct." + className + "*");
+            objClass.peek().put(bitcast, className);
+            
+            return bitcast; // Constructor returns the object pointer
+        } 
+        else {
+            // Regular method call on an object
+            
+            // Find the class of the object
+            String className = objClass.peek().get(objName);
+            if (className == null) {
+                throw new RuntimeException("Object " + objName + " has no associated class type");
+            }
+            
+            // Load the object pointer
+            String objPtr;
+            if (isRegister(objName)) {
+                objPtr = slotOf(objName);
+            } else {
+                String slot = slotOf(objName);
+                String ty = typeOf(objName);
+                objPtr = reg();
+                out().append("  ").append(objPtr)
+                    .append(" = load ").append(ty)
+                    .append(", ").append(ty).append("* ").append(slot).append("\n");
+            }
+            
+            // Call the method
+            String methodFullName = className + "_" + methodName;
+            out().append("  call void @").append(methodFullName)
+                .append("(%struct.").append(className).append("* ").append(objPtr);
+            
+            // Add arguments if any
+            if (ctx.argumentList() != null) {
+                for (int i = 0; i < ctx.argumentList().expression().size(); i++) {
+                    String arg = visit(ctx.argumentList().expression(i));
+                    out().append(", i32 ").append(arg);
+                }
+            }
+            
+            out().append(")\n");
+            return null; // Regular method calls don't return a value in our simplified model
+        }
+    }
+
+    //——————————— Function Call ———————————
+    @Override 
+    public String visitFunctionCall(delphiParser.FunctionCallContext ctx) {
+        String name = ctx.IDENTIFIER().getText();
+        
+        // Handle class construction: ClassName()
+        if (classes.containsKey(name)) {
+            // 1. Malloc the space for the class
+            String size = sizeofStruct(name);
+            String mallocResult = reg();
+            out().append("  ").append(mallocResult)
+                .append(" = call i8* @malloc(i32 ").append(size).append(")\n");
+            
+            // 2. Bitcast to the struct pointer type
+            String bitcast = reg();
+            out().append("  ").append(bitcast)
+                .append(" = bitcast i8* ").append(mallocResult)
+                .append(" to %struct.").append(name).append("*\n");
+            
+            // Register this as an instance of the class
+            regIds.peek().add(bitcast);
+            vSlots.peek().put(bitcast, bitcast);
+            vTypes.peek().put(bitcast, "%struct." + name + "*");
+            objClass.peek().put(bitcast, name);
+            
+            return bitcast;
+        }
+        
+        // Regular function calls
+        if (funcs.containsKey(name)) {
+            FuncInfo f = funcs.get(name);
+            String dst = reg();
+            out().append("  ").append(dst).append(" = call ")
+                  .append(llTy(f.retType)).append(" @").append(name).append('(');
+            
+            // Handle arguments
+            List<String> argRegs = new ArrayList<>();
+            if (ctx.argumentList() != null) {
+                for (var e : ctx.argumentList().expression()) {
+                    argRegs.add(visit(e));
+                }
+            }
+            
+            for (int i = 0; i < argRegs.size(); i++) {
+                if (i > 0) out().append(", ");
+                out().append(llTy(f.pTypes.get(i))).append(' ').append(argRegs.get(i));
+            }
+            out().append(")\n");
+            return dst;
+        }
+        
+        // Other built-in functions
+        if (name.equals("readInt")) {
+            String dst = reg();
+            out().append("  ").append(dst).append(" = call i32 @readInt()\n");
+            return dst;
+        }
+        
+        return super.visitFunctionCall(ctx);
+    }
+
+    //——————————— main() driver ———————————
+    public static void main(String[] args) throws IOException {
+        if (args.length != 1) {
+            System.err.println("Usage: java LLVMGenerator <.pas>");
+            System.exit(1);
+        }
+        Path src = Paths.get(args[0]);
+        if (!Files.exists(src)) {
+            System.err.println("File not found: " + src);
+            System.exit(2);
+        }
+        String fn   = src.getFileName().toString();
+        String base = fn.endsWith(".pas") ? fn.substring(0, fn.length()-4) : fn;
+        Path outDir = Paths.get("output");
+        if (!Files.exists(outDir)) Files.createDirectories(outDir);
+        Path out = outDir.resolve(base + ".ll");
+
+        CharStream       input  = CharStreams.fromPath(src);
+        delphiLexer      lex    = new delphiLexer(input);
+        CommonTokenStream tok    = new CommonTokenStream(lex);
+        delphiParser     parser = new delphiParser(tok);
+        ParseTree        tree   = parser.program();
+
+        LLVMGenerator g = new LLVMGenerator();
+        String ir = g.compile(tree);
+        Files.writeString(out, ir);
+        System.out.println("Wrote IR to " + out.toAbsolutePath());
+    }
+}

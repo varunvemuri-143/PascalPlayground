@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pascal to WebAssembly Playground</title>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary-color: #3498db;
+            --secondary-color: #2ecc71;
+            --dark-color: #2c3e50;
+            --light-color: #ecf0f1;
+            --danger-color: #e74c3c;
+            --warning-color: #f39c12;
+        }
+        
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            font-family: 'Roboto', sans-serif;
+            line-height: 1.6;
+            color: var(--dark-color);
+            background-color: var(--light-color);
+            padding: 0;
+            margin: 0;
+        }
+        
+        .container {
+            width: 100%;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+        
+        header {
+            background-color: var(--primary-color);
+            color: white;
+            padding: 1rem 0;
+            text-align: center;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        
+        h1 {
+            margin-bottom: 0.5rem;
+        }
+        
+        .subtitle {
+            font-weight: 300;
+            margin-bottom: 1rem;
+        }
+        
+        .card {
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            padding: 2rem;
+            margin-bottom: 2rem;
+        }
+        
+        .control-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+        
+        .select-wrapper {
+            position: relative;
+            width: 100%;
+        }
+        
+        select {
+            width: 100%;
+            padding: 12px;
+            font-size: 16px;
+            border: 2px solid #ddd;
+            border-radius: 4px;
+            appearance: none;
+            background-color: white;
+            cursor: pointer;
+        }
+        
+        .select-wrapper::after {
+            content: '▼';
+            position: absolute;
+            right: 15px;
+            top: 50%;
+            transform: translateY(-50%);
+            pointer-events: none;
+        }
+        
+        select:focus {
+            outline: none;
+            border-color: var(--primary-color);
+        }
+        
+        button {
+            padding: 12px 20px;
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        
+        button:hover {
+            background-color: #2980b9;
+        }
+        
+        button:disabled {
+            background-color: #bdc3c7;
+            cursor: not-allowed;
+        }
+        
+        .button-row {
+            display: flex;
+            gap: 1rem;
+        }
+        
+        .output-panel {
+            border: 1px solid #ddd;
+            padding: 1rem;
+            border-radius: 4px;
+            background-color: #f9f9f9;
+            min-height: 300px;
+            max-height: 500px;
+            overflow-y: auto;
+            font-family: monospace;
+            white-space: pre-wrap;
+        }
+        
+        .output-panel:empty::before {
+            content: "Program output will appear here";
+            color: #aaa;
+            font-style: italic;
+        }
+        
+        .loader {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(255,255,255,0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 1s ease-in-out infinite;
+            margin-right: 10px;
+            vertical-align: middle;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .hidden {
+            display: none;
+        }
+        
+        .info-box {
+            background-color: #d1ecf1;
+            border: 1px solid #bee5eb;
+            color: #0c5460;
+            padding: 1rem;
+            border-radius: 4px;
+            margin-bottom: 1rem;
+        }
+        
+        .error-box {
+            background-color: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+            padding: 1rem;
+            border-radius: 4px;
+            margin-bottom: 1rem;
+        }
+        
+        footer {
+            text-align: center;
+            padding: 2rem 0;
+            color: #666;
+            font-size: 0.9rem;
+        }
+        
+        .pascal-sample {
+            background-color: #f8f9fa;
+            border-left: 4px solid var(--primary-color);
+            padding: 1rem;
+            margin-bottom: 1rem;
+            font-family: monospace;
+            white-space: pre-wrap;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                padding: 1rem;
+            }
+            
+            .button-row {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="container">
+            <h1>Pascal to WebAssembly Playground</h1>
+            <div class="subtitle">Run compiled Pascal programs directly in your browser</div>
+        </div>
+    </header>
+    
+    <div class="container">
+        <div class="card">
+            <h2>Run Pascal Programs</h2>
+            <p>Select a pre-compiled WebAssembly file to run:</p>
+            
+            <div class="control-panel">
+                <div class="select-wrapper">
+                    <select id="wasmSelect">
+                        <option value="" disabled selected>Choose a program to run...</option>
+                        <!-- This will be populated dynamically -->
+                    </select>
+                </div>
+                
+                <div id="programDescription" class="info-box hidden">
+                    <!-- Program description will appear here -->
+                </div>
+                
+                <div class="button-row">
+                    <button id="runButton" disabled>
+                        <span id="loader" class="loader hidden"></span>
+                        Run Program
+                    </button>
+                    <button id="clearButton" disabled>Clear Output</button>
+                </div>
+            </div>
+            
+            <h3>Program Output:</h3>
+            <div id="output" class="output-panel"></div>
+        </div>
+        
+        <div class="card">
+            <h2>About This Project</h2>
+            <p>This playground allows you to run Pascal programs that have been compiled to WebAssembly using our custom Pascal-to-LLVM IR compiler.</p>
+            
+            <h3>Features:</h3>
+            <ul>
+                <li>Class support with inheritance</li>
+                <li>Constructors and destructors</li>
+                <li>Procedural programming with functions and procedures</li>
+                <li>Control flow structures (loops, conditionals)</li>
+                <li>Proper variable scope handling</li>
+            </ul>
+            
+            <h3>Example Pascal Program:</h3>
+            <div class="pascal-sample">program TestInheritance;
+type
+  SystemBase = class
+    public:
+      procedure Initialize();
+      begin
+        writeln('SystemBase: hardware and OS initialized');
+      end;
+  end;
+
+  Workstation = class(SystemBase)
+    public:
+      procedure StartupSequence();
+      begin
+        writeln('Workstation: loading user profile and applications');
+      end;
+  end;
+
+var
+  ws: Workstation;
+
+begin
+  ws := Workstation();
+  ws.Initialize();
+  ws.StartupSequence();
+end.</div>
+        </div>
+    </div>
+    
+    <footer>
+        <div class="container">
+            <p>Pascal-to-WebAssembly Compiler Project &copy; 2023</p>
+        </div>
+    </footer>
+    
+    <script src="wasm_player.js"></script>
+</body>
+</html>
