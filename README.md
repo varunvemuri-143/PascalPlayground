@@ -1,4 +1,4 @@
-# Delphi Pascal Interpreter - Project 1 and Project 2 and Project 3 
+# Delphi Pascal Interpreter 
 
 This project implements an interpreter for a subset of Delphi (Object Pascal) using ANTLR4 and Java.
 
@@ -135,8 +135,3 @@ All test cases now compile correctly to LLVM IR and WebAssembly, preserving the 
 
 ---
 
-## 📦 Submission Includes
-- `grammar/delphi.g4`
-- Java interpreter code in `src/main/`
-- Test cases in `Tests_final/`
-- `README.md` file
